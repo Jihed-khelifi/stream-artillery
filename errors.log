@@ -1,0 +1,2 @@
+2025/10/28 21:14:57 === Stream Artillery Error Log ===
+2025/10/28 21:14:57 Target: http://localhost:4000/chat/completions, Workers: 3, Hits: 1, HTTP Clients: 6
