@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -16,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"stream-artillery/internal/stream"
 )
 
 const defaultJSONBody = `{
@@ -66,28 +65,44 @@ type Stats struct {
 	mu                  sync.Mutex
 }
 
+func (s *Stats) AddTotalChunks(n int64) {
+	s.totalChunks.Add(n)
+}
+
+func (s *Stats) AddTotalBytes(n int64) {
+	s.totalBytes.Add(n)
+}
+
 func main() {
 	var url string
 	var hits int
 	var concurrency int
 	var hcc int
 	var jsonBody string
+	var stopConditionType string
+	var stopConditionValue string
 
 	flag.StringVar(&url, "url", "http://localhost:4000", "target URL")
 	flag.IntVar(&concurrency, "w", 3, "number of concurrent workers")
 	flag.IntVar(&hits, "hits", 1, "number of requests each worker sends simultaneously")
-	flag.IntVar(&hcc, "hcc", 0, "number of http clients to create") // 0 means new client per request, otherwise share clients between workers
+	flag.IntVar(&hcc, "hcc", 0, "number of http clients to create")
 	flag.StringVar(&jsonBody, "jsonBody", "", "JSON body as string or path to .json file (if empty, uses default)")
+	flag.StringVar(&stopConditionType, "stop-condition-type", "content", "stop condition type: content, bytes, or chunks")
+	flag.StringVar(&stopConditionValue, "stop-condition-value", "data: [DONE]", "stop condition value (pattern for content, numeric limit for bytes/chunks)")
 	flag.Parse()
 
 	if url == "" {
 		log.Fatal("URL is required")
 	}
 
-	// Load JSON body from string or file
 	requestBody, err := loadJSONBody(jsonBody)
 	if err != nil {
 		log.Fatalf("Failed to load JSON body: %v", err)
+	}
+
+	stopCondition, err := stream.NewStopConditionFromFlags(stopConditionType, stopConditionValue)
+	if err != nil {
+		log.Fatalf("Failed to create stop condition: %v", err)
 	}
 
 	fmt.Printf("--Stream Artillery - Stress Test for Brokk-llm-- \n")
@@ -139,7 +154,7 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			runWorker(ctx, workerID, url, hits, stats, clients, requestBody)
+			runWorker(ctx, workerID, url, hits, stats, clients, requestBody, stopCondition)
 		}(i)
 	}
 
@@ -170,11 +185,9 @@ func main() {
 
 }
 
-func runWorker(ctx context.Context, workerID int, url string, hits int, stats *Stats, clients []*http.Client, requestBody string) {
+func runWorker(ctx context.Context, workerID int, url string, hits int, stats *Stats, clients []*http.Client, requestBody string, condition stream.StreamStopCondition) {
 	var wg sync.WaitGroup
 
-	// Launch all hits simultaneously for this worker
-	// NO SLEEP - we want concurrent requests on the same connection
 	for i := 0; i < hits; i++ {
 		wg.Add(1)
 		go func(hitID int) {
@@ -191,51 +204,27 @@ func runWorker(ctx context.Context, workerID int, url string, hits int, stats *S
 					},
 				}
 			} else {
-				// Use round-robin to distribute requests across available clients
 				clientIndex := (workerID*hits + hitID) % len(clients)
 				client = clients[clientIndex]
 			}
 
-			makeStreamingRequest(ctx, workerID, hitID, url, stats, client, requestBody)
+			makeStreamingRequest(ctx, workerID, hitID, url, stats, client, requestBody, condition)
 		}(i)
 	}
 
 	wg.Wait()
 }
 
-func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, stats *Stats, client *http.Client, requestBody string) {
+func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, stats *Stats, client *http.Client, requestBody string, condition stream.StreamStopCondition) {
 	requestID := fmt.Sprintf("W%d-H%d", workerID, hitID)
 	stats.totalRequests.Add(1)
 
-	// isHighReasoning := (workerID+hitID)%2 == 0
-	// body := defaultJSONBody
-	// if isHighReasoning {
-	// 	body = highReasoning
-	// }
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBufferString(requestBody))
-	if err != nil {
-		logError(stats, requestID, "Failed to create request", err)
-		stats.failedRequests.Add(1)
-		return
-	}
+	result := stream.ExecuteStream(ctx, url, requestBody, client, condition, stats)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream; charset=utf-8")
-	req.Header.Set("Connection", "keep-alive")
+	if result.Err != nil {
+		logError(stats, requestID, "Request failed", result.Err)
 
-	startTime := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		logError(stats, requestID, "Failed to send request", err)
-		stats.failedRequests.Add(1)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		logError(stats, requestID, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status), nil)
-
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+		if strings.Contains(result.Err.Error(), "503") || strings.Contains(result.Err.Error(), "429") {
 			stats.maxConcurrentErrors.Add(1)
 		}
 
@@ -243,45 +232,9 @@ func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, 
 		return
 	}
 
-	reader := bufio.NewReader(resp.Body)
-	chunkCount := 0
-	totalBytes := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		chunk, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				// End of stream reached successfully
-				break
-			}
-			logError(stats, requestID, "Error reading stream", err)
-			stats.failedRequests.Add(1)
-			return
-		}
-
-		if len(chunk) > 0 {
-			chunkCount++
-			totalBytes += len(chunk)
-			stats.totalChunks.Add(1)
-			stats.totalBytes.Add(int64(len(chunk)))
-
-			if bytes.Contains(chunk, []byte("data: [DONE]")) {
-				break
-			}
-		}
-	}
-
-	duration := time.Since(startTime)
 	stats.successfulRequests.Add(1)
-
 	fmt.Printf("✓ %s completed: %d chunks, %d bytes, %.2fs\n",
-		requestID, chunkCount, totalBytes, duration.Seconds())
+		requestID, result.ChunkCount, result.TotalBytes, result.Duration.Seconds())
 }
 
 func logError(stats *Stats, requestID, message string, err error) {
