@@ -347,6 +347,7 @@ func TestExecuteStream_HTTPError(t *testing.T) {
 
 func TestExecuteStream_ContextCancel(t *testing.T) {
 	blockChan := make(chan struct{})
+	handlerDone := make(chan struct{})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -358,9 +359,9 @@ func TestExecuteStream_ContextCancel(t *testing.T) {
 		}
 
 		<-blockChan
+		close(handlerDone)
 	}))
 	defer server.Close()
-	defer close(blockChan)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -368,8 +369,6 @@ func TestExecuteStream_ContextCancel(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		cancel()
-		time.Sleep(50 * time.Millisecond)
-		blockChan <- struct{}{}
 	}()
 
 	result := stream.ExecuteStream(
@@ -380,6 +379,9 @@ func TestExecuteStream_ContextCancel(t *testing.T) {
 		nil,
 		nil,
 	)
+
+	close(blockChan)
+	<-handlerDone
 
 	if result.Err == nil {
 		t.Fatal("expected context cancellation error")
