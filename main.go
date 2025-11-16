@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"stream-artillery/internal/stream"
+	"stream-artillery/stream"
 )
 
 const defaultJSONBody = `{
