@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"stream-artillery/internal/cli"
 	"stream-artillery/stream"
 )
 
@@ -105,13 +106,20 @@ func main() {
 		log.Fatalf("Failed to create stop condition: %v", err)
 	}
 
-	fmt.Printf("--Stream Artillery - Stress Test for Brokk-llm-- \n")
-	fmt.Printf("Target URL: %s\n", url)
-	fmt.Printf("Workers: %d\n", concurrency)
-	fmt.Printf("Hits per worker: %d\n", hits)
-	fmt.Printf("Total requests: %d\n", concurrency*hits)
-	fmt.Printf("HTTP Clients: %d\n", hcc)
-	fmt.Printf("\n\n")
+	fmt.Printf("\033[H\033[2J")
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
+	fmt.Println("                Stream Artillery - Stress Test for Brokk-llm               ")
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
+	fmt.Printf("Target URL:       %s\n", url)
+	fmt.Printf("Workers:          %d\n", concurrency)
+	fmt.Printf("Hits per worker:  %d\n", hits)
+	fmt.Printf("Total requests:   %d\n", concurrency*hits)
+	fmt.Printf("HTTP Clients:     %d\n", hcc)
+	fmt.Printf("Stop Condition:   %s = %s\n", stopConditionType, stopConditionValue)
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
+	fmt.Println()
+	fmt.Println("Initializing...")
+	time.Sleep(1 * time.Second)
 
 	errorFile, err := os.Create("errors.log")
 	if err != nil {
@@ -145,47 +153,45 @@ func main() {
 		}
 	}
 
+	display := cli.NewAnimatedDisplay(100 * time.Millisecond)
+
+	for i := 0; i < concurrency; i++ {
+		for j := 0; j < hits; j++ {
+			display.RegisterWorker(i, j)
+		}
+	}
+
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start workers
+	done := make(chan bool)
+	go renderLoop(display, stats, done)
+
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			runWorker(ctx, workerID, url, hits, stats, clients, requestBody, stopCondition)
+			runWorker(ctx, workerID, url, hits, stats, clients, requestBody, stopCondition, display)
 		}(i)
 	}
-
-	done := make(chan bool)
-	go reportStats(stats, done)
 
 	wg.Wait()
 	done <- true
 
-	duration := time.Since(stats.startTime)
-	total := stats.totalRequests.Load()
-	successful := stats.successfulRequests.Load()
-	failed := stats.failedRequests.Load()
-	chunks := stats.totalChunks.Load()
-	bytes := stats.totalBytes.Load()
-	maxConcurrentErrors := stats.maxConcurrentErrors.Load()
+	finalStats := cli.AggregateStats{
+		TotalRequests:      stats.totalRequests.Load(),
+		SuccessfulRequests: stats.successfulRequests.Load(),
+		FailedRequests:     stats.failedRequests.Load(),
+		TotalChunks:        stats.totalChunks.Load(),
+		TotalBytes:         stats.totalBytes.Load(),
+		Elapsed:            time.Since(stats.startTime),
+	}
 
-	fmt.Printf("\n\n")
-	fmt.Printf("Duration:             %.2fs\n", duration.Seconds())
-	fmt.Printf("Total Requests:       %d\n", total)
-	fmt.Printf("Successful:           %d (%.1f%%)\n", successful, float64(successful)/float64(total)*100)
-	fmt.Printf("Failed:               %d (%.1f%%)\n", failed, float64(failed)/float64(total)*100)
-	fmt.Printf("Max Concurrent Errors: %d\n", maxConcurrentErrors)
-	fmt.Printf("Total Chunks:         %d\n", chunks)
-	fmt.Printf("Total Bytes:          %s\n", formatBytes(bytes))
-	fmt.Printf("Avg Chunks/Request:   %.2f\n", float64(chunks)/float64(successful))
-	fmt.Printf("Requests/Second:      %.2f\n", float64(total)/duration.Seconds())
-
+	display.RenderFinal(finalStats)
 }
 
-func runWorker(ctx context.Context, workerID int, url string, hits int, stats *Stats, clients []*http.Client, requestBody string, condition stream.StreamStopCondition) {
+func runWorker(ctx context.Context, workerID int, url string, hits int, stats *Stats, clients []*http.Client, requestBody string, condition stream.StreamStopCondition, display *cli.AnimatedDisplay) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < hits; i++ {
@@ -208,18 +214,27 @@ func runWorker(ctx context.Context, workerID int, url string, hits int, stats *S
 				client = clients[clientIndex]
 			}
 
-			makeStreamingRequest(ctx, workerID, hitID, url, stats, client, requestBody, condition)
+			makeStreamingRequest(ctx, workerID, hitID, url, stats, client, requestBody, condition, display)
 		}(i)
 	}
 
 	wg.Wait()
 }
 
-func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, stats *Stats, client *http.Client, requestBody string, condition stream.StreamStopCondition) {
+func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, stats *Stats, client *http.Client, requestBody string, condition stream.StreamStopCondition, display *cli.AnimatedDisplay) {
 	requestID := fmt.Sprintf("W%d-H%d", workerID, hitID)
 	stats.totalRequests.Add(1)
 
-	result := stream.ExecuteStream(ctx, url, requestBody, client, condition, stats)
+	observer := &streamObserver{
+		workerID: workerID,
+		hitID:    hitID,
+		display:  display,
+		startTime: time.Now(),
+	}
+
+	display.UpdateWorker(workerID, hitID, cli.StateStreaming, 0, 0, 0, "")
+
+	result := stream.ExecuteStreamWithObserver(ctx, url, requestBody, client, condition, stats, observer)
 
 	if result.Err != nil {
 		logError(stats, requestID, "Request failed", result.Err)
@@ -229,12 +244,26 @@ func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, 
 		}
 
 		stats.failedRequests.Add(1)
+		display.UpdateWorker(workerID, hitID, cli.StateError, result.ChunkCount, int64(result.TotalBytes), result.Duration, result.Err.Error())
 		return
 	}
 
 	stats.successfulRequests.Add(1)
-	fmt.Printf("✓ %s completed: %d chunks, %d bytes, %.2fs\n",
-		requestID, result.ChunkCount, result.TotalBytes, result.Duration.Seconds())
+	display.UpdateWorker(workerID, hitID, cli.StateSuccess, result.ChunkCount, int64(result.TotalBytes), result.Duration, "")
+}
+
+type streamObserver struct {
+	workerID  int
+	hitID     int
+	display   *cli.AnimatedDisplay
+	startTime time.Time
+}
+
+func (o *streamObserver) OnChunk(chunk []byte, chunkCount int, totalBytes int64, elapsed time.Duration) {
+	o.display.UpdateWorker(o.workerID, o.hitID, cli.StateStreaming, chunkCount, totalBytes, elapsed, "")
+}
+
+func (o *streamObserver) OnComplete(result stream.StreamResult) {
 }
 
 func logError(stats *Stats, requestID, message string, err error) {
@@ -252,8 +281,8 @@ func logError(stats *Stats, requestID, message string, err error) {
 	}
 }
 
-func reportStats(stats *Stats, done chan bool) {
-	ticker := time.NewTicker(5 * time.Second)
+func renderLoop(display *cli.AnimatedDisplay, stats *Stats, done chan bool) {
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -262,30 +291,17 @@ func reportStats(stats *Stats, done chan bool) {
 			ticker.Stop()
 			return
 		case <-ticker.C:
-			elapsed := time.Since(stats.startTime).Seconds()
-			total := stats.totalRequests.Load()
-			successful := stats.successfulRequests.Load()
-			failed := stats.failedRequests.Load()
-			chunks := stats.totalChunks.Load()
-			bytes := stats.totalBytes.Load()
-
-			fmt.Printf("\n📊 Stats [%.1fs]: Total: %d | Success: %d | Failed: %d | Chunks: %d | Bytes: %s | RPS: %.2f\n\n",
-				elapsed, total, successful, failed, chunks, formatBytes(bytes), float64(total)/elapsed)
+			aggregateStats := cli.AggregateStats{
+				TotalRequests:      stats.totalRequests.Load(),
+				SuccessfulRequests: stats.successfulRequests.Load(),
+				FailedRequests:     stats.failedRequests.Load(),
+				TotalChunks:        stats.totalChunks.Load(),
+				TotalBytes:         stats.totalBytes.Load(),
+				Elapsed:            time.Since(stats.startTime),
+			}
+			display.Render(aggregateStats)
 		}
 	}
-}
-
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func loadJSONBody(input string) (string, error) {
