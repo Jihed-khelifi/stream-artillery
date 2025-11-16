@@ -15,6 +15,11 @@ type MetricsRecorder interface {
 	AddTotalBytes(int64)
 }
 
+type StreamObserver interface {
+	OnChunk(chunk []byte, chunkCount int, totalBytes int64, elapsed time.Duration)
+	OnComplete(result StreamResult)
+}
+
 type StreamResult struct {
 	ChunkCount int
 	TotalBytes int
@@ -22,13 +27,14 @@ type StreamResult struct {
 	Err        error
 }
 
-func ExecuteStream(
+func ExecuteStreamWithObserver(
 	ctx context.Context,
 	url string,
 	requestBody string,
 	client *http.Client,
 	condition StreamStopCondition,
 	metrics MetricsRecorder,
+	observer StreamObserver,
 ) StreamResult {
 	result := StreamResult{}
 	startTime := time.Now()
@@ -36,6 +42,10 @@ func ExecuteStream(
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBufferString(requestBody))
 	if err != nil {
 		result.Err = fmt.Errorf("failed to create request: %w", err)
+		result.Duration = time.Since(startTime)
+		if observer != nil {
+			observer.OnComplete(result)
+		}
 		return result
 	}
 
@@ -46,12 +56,20 @@ func ExecuteStream(
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Err = fmt.Errorf("failed to send request: %w", err)
+		result.Duration = time.Since(startTime)
+		if observer != nil {
+			observer.OnComplete(result)
+		}
 		return result
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		result.Err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+		result.Duration = time.Since(startTime)
+		if observer != nil {
+			observer.OnComplete(result)
+		}
 		return result
 	}
 
@@ -62,6 +80,9 @@ func ExecuteStream(
 		case <-ctx.Done():
 			result.Err = ctx.Err()
 			result.Duration = time.Since(startTime)
+			if observer != nil {
+				observer.OnComplete(result)
+			}
 			return result
 		default:
 		}
@@ -73,6 +94,9 @@ func ExecuteStream(
 			}
 			result.Err = fmt.Errorf("error reading stream: %w", err)
 			result.Duration = time.Since(startTime)
+			if observer != nil {
+				observer.OnComplete(result)
+			}
 			return result
 		}
 
@@ -85,6 +109,11 @@ func ExecuteStream(
 				metrics.AddTotalBytes(int64(len(chunk)))
 			}
 
+			if observer != nil {
+				elapsed := time.Since(startTime)
+				observer.OnChunk(chunk, result.ChunkCount, int64(result.TotalBytes), elapsed)
+			}
+
 			if condition != nil && condition.ShouldStop(chunk, int64(result.TotalBytes), result.ChunkCount) {
 				break
 			}
@@ -92,5 +121,19 @@ func ExecuteStream(
 	}
 
 	result.Duration = time.Since(startTime)
+	if observer != nil {
+		observer.OnComplete(result)
+	}
 	return result
+}
+
+func ExecuteStream(
+	ctx context.Context,
+	url string,
+	requestBody string,
+	client *http.Client,
+	condition StreamStopCondition,
+	metrics MetricsRecorder,
+) StreamResult {
+	return ExecuteStreamWithObserver(ctx, url, requestBody, client, condition, metrics, nil)
 }
