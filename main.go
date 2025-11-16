@@ -83,17 +83,41 @@ func main() {
 	var stopConditionType string
 	var stopConditionValue string
 
-	flag.StringVar(&url, "url", "http://localhost:4000", "target URL")
-	flag.IntVar(&concurrency, "w", 3, "number of concurrent workers")
-	flag.IntVar(&hits, "hits", 1, "number of requests each worker sends simultaneously")
-	flag.IntVar(&hcc, "hcc", 0, "number of http clients to create")
-	flag.StringVar(&jsonBody, "jsonBody", "", "JSON body as string or path to .json file (if empty, uses default)")
-	flag.StringVar(&stopConditionType, "stop-condition-type", "content", "stop condition type: content, bytes, or chunks")
-	flag.StringVar(&stopConditionValue, "stop-condition-value", "data: [DONE]", "stop condition value (pattern for content, numeric limit for bytes/chunks)")
+	flag.StringVar(&url, "url", "http://localhost:4000", "Target SSE endpoint URL to stress test")
+	flag.IntVar(&concurrency, "w", 3, "Number of concurrent workers (visualized as rows in the dashboard)")
+	flag.IntVar(&hits, "hits", 1, "Number of simultaneous requests per worker (columns in each row)")
+	flag.IntVar(&hcc, "hcc", 0, "HTTP client pool size: 0 = fresh client per request; >0 = reuse pooled clients")
+	flag.StringVar(&jsonBody, "jsonBody", "", "Request body: JSON string, path to .json file, or empty for default OpenAI-style payload")
+	flag.StringVar(&stopConditionType, "stop-condition-type", "content", "Stream stop condition: 'content' (match pattern), 'bytes' (byte limit), or 'chunks' (chunk limit)")
+	flag.StringVar(&stopConditionValue, "stop-condition-value", "data: [DONE]", "Stop condition value: pattern string for 'content', numeric limit for 'bytes'/'chunks'")
 	flag.Parse()
 
 	if url == "" {
-		log.Fatal("URL is required")
+		log.Fatal("Error: -url flag is required")
+	}
+
+	if concurrency < 1 {
+		log.Fatal("Error: -w (workers) must be at least 1")
+	}
+
+	if hits < 1 {
+		log.Fatal("Error: -hits must be at least 1")
+	}
+
+	if hcc < 0 {
+		log.Fatal("Error: -hcc (HTTP client count) cannot be negative")
+	}
+
+	totalRequests := concurrency * hits
+	if totalRequests > 10000 {
+		fmt.Printf("Warning: Planning to send %d total requests. This may be resource-intensive.\n", totalRequests)
+		fmt.Print("Continue? (y/N): ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(strings.TrimSpace(response)) != "y" {
+			fmt.Println("Aborted.")
+			os.Exit(0)
+		}
 	}
 
 	requestBody, err := loadJSONBody(jsonBody)
@@ -106,19 +130,33 @@ func main() {
 		log.Fatalf("Failed to create stop condition: %v", err)
 	}
 
-	fmt.Printf("\033[H\033[2J")
+	bodyDesc := "default OpenAI-style payload"
+	if jsonBody != "" {
+		if strings.HasSuffix(jsonBody, ".json") {
+			bodyDesc = fmt.Sprintf("loaded from %s", jsonBody)
+		} else {
+			bodyDesc = "custom JSON string"
+		}
+	}
+
+	fmt.Print("\033[H\033[2J")
 	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
-	fmt.Println("                Stream Artillery - Stress Test for Brokk-llm               ")
+	fmt.Println("                         Stream Artillery v1.0                             ")
+	fmt.Println("            SSE Streaming Stress Test with Live Visualization              ")
 	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
-	fmt.Printf("Target URL:       %s\n", url)
-	fmt.Printf("Workers:          %d\n", concurrency)
-	fmt.Printf("Hits per worker:  %d\n", hits)
-	fmt.Printf("Total requests:   %d\n", concurrency*hits)
-	fmt.Printf("HTTP Clients:     %d\n", hcc)
-	fmt.Printf("Stop Condition:   %s = %s\n", stopConditionType, stopConditionValue)
+	fmt.Printf("Target URL:        %s\n", url)
+	fmt.Printf("Concurrency:       %d workers × %d hits = %d total requests\n", concurrency, hits, totalRequests)
+
+	clientPoolDesc := "per-request"
+	if hcc > 0 {
+		clientPoolDesc = fmt.Sprintf("pooled (%d clients)", hcc)
+	}
+	fmt.Printf("HTTP Clients:      %s\n", clientPoolDesc)
+	fmt.Printf("Stop Condition:    %s = '%s'\n", stopConditionType, stopConditionValue)
+	fmt.Printf("Request Body:      %s\n", bodyDesc)
 	fmt.Println("═══════════════════════════════════════════════════════════════════════════")
 	fmt.Println()
-	fmt.Println("Initializing...")
+	fmt.Println("Initializing workers and display...")
 	time.Sleep(1 * time.Second)
 
 	errorFile, err := os.Create("errors.log")
@@ -191,7 +229,17 @@ func main() {
 	display.RenderFinal(finalStats)
 }
 
-func runWorker(ctx context.Context, workerID int, url string, hits int, stats *Stats, clients []*http.Client, requestBody string, condition stream.StreamStopCondition, display *cli.AnimatedDisplay) {
+func runWorker(
+	ctx context.Context,
+	workerID int,
+	url string,
+	hits int,
+	stats *Stats,
+	clients []*http.Client,
+	requestBody string,
+	condition stream.StreamStopCondition,
+	display *cli.AnimatedDisplay,
+) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < hits; i++ {
@@ -221,14 +269,23 @@ func runWorker(ctx context.Context, workerID int, url string, hits int, stats *S
 	wg.Wait()
 }
 
-func makeStreamingRequest(ctx context.Context, workerID, hitID int, url string, stats *Stats, client *http.Client, requestBody string, condition stream.StreamStopCondition, display *cli.AnimatedDisplay) {
+func makeStreamingRequest(
+	ctx context.Context,
+	workerID, hitID int,
+	url string,
+	stats *Stats,
+	client *http.Client,
+	requestBody string,
+	condition stream.StreamStopCondition,
+	display *cli.AnimatedDisplay,
+) {
 	requestID := fmt.Sprintf("W%d-H%d", workerID, hitID)
 	stats.totalRequests.Add(1)
 
 	observer := &streamObserver{
-		workerID: workerID,
-		hitID:    hitID,
-		display:  display,
+		workerID:  workerID,
+		hitID:     hitID,
+		display:   display,
 		startTime: time.Now(),
 	}
 
@@ -288,7 +345,6 @@ func renderLoop(display *cli.AnimatedDisplay, stats *Stats, done chan bool) {
 	for {
 		select {
 		case <-done:
-			ticker.Stop()
 			return
 		case <-ticker.C:
 			aggregateStats := cli.AggregateStats{
